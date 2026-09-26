@@ -1,0 +1,348 @@
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DB_PATH = os.environ.get('NAIWA_DB', './naiwa.db')
+HOST = os.environ.get('NAIWA_HOST', '127.0.0.1')
+PORT = int(os.environ.get('NAIWA_PORT', '3900'))
+
+SECRET_RE = re.compile(r'^[a-f0-9]{64}$')
+NICKNAME_MAX = 30
+TOP_N = 50
+
+# 署名信息由服务端权威下发，前端仅校验签名后渲染，防止篡改开发者署名。
+# 部署时可通过环境变量 NAIWA_LICENSE_KEY 覆盖默认密钥，替换后请同步更新前端 license.js 中的密钥。
+LICENSE_KEY = os.environ.get('NAIWA_LICENSE_KEY', 'naiwa-kuaipao-2026-bjh-7f3a9c1e')
+LICENSE_ITEMS = {
+    'devName': '毕加昊',
+    'avatar': 'https://p.qlogo.cn/gh/995401955/995401955/',
+    'links': [
+        {'text': '联系反馈', 'href': 'https://qm.qq.com/q/s7pmWRIvRY'},
+        {'text': '下载源码', 'href': 'https://qm.qq.com/q/PunKXbKx4A'},
+    ],
+}
+
+
+def license_payload():
+    payload = {
+        'ts': int(time.time()),
+        'items': LICENSE_ITEMS,
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    sig = hmac.new(LICENSE_KEY.encode('utf-8'), body.encode('utf-8'), hashlib.sha256).hexdigest()
+    return {'payload': payload, 'sig': sig}
+
+_db_lock = threading.Lock()
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+
+def init_db():
+    with get_db() as conn:
+        conn.executescript('''
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            secret TEXT UNIQUE NOT NULL,
+            nickname TEXT NOT NULL DEFAULT '游客',
+            best INTEGER NOT NULL DEFAULT 0,
+            best_map TEXT,
+            runs INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            map TEXT,
+            distance INTEGER NOT NULL DEFAULT 0,
+            coins INTEGER NOT NULL DEFAULT 0,
+            duration INTEGER NOT NULL DEFAULT 0,
+            finished INTEGER NOT NULL DEFAULT 0,
+            ended INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_runs_player ON runs(player_id);
+        CREATE INDEX IF NOT EXISTS idx_players_best ON players(best DESC);
+        ''')
+
+
+def find_player(conn, secret):
+    row = conn.execute('SELECT * FROM players WHERE secret=?', (secret,)).fetchone()
+    return row
+
+
+def player_payload(row):
+    return {
+        'id': row['id'],
+        'nickname': row['nickname'],
+        'best': row['best'],
+        'runs': row['runs'],
+    }
+
+
+def rank_of(conn, player_id):
+    row = conn.execute(
+        'SELECT COUNT(*) AS c FROM players WHERE best > '
+        '(SELECT best FROM players WHERE id=?) OR '
+        '(best = (SELECT best FROM players WHERE id=?) AND id < ?)',
+        (player_id, player_id, player_id),
+    ).fetchone()
+    return row['c'] + 1 if row else 1
+
+
+def history_of(conn, player_id):
+    rows = conn.execute(
+        'SELECT map, distance, coins, duration, finished, ended FROM runs '
+        'WHERE player_id=? AND ended IS NOT NULL ORDER BY ended DESC LIMIT 30',
+        (player_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = 'NaiwaServer/1.0'
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, status, obj):
+    body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+    self.send_response(status)
+    self.send_header('Content-Type', 'application/json; charset=utf-8')
+    self.send_header('Content-Length', str(len(body)))
+    self.send_header('Cache-Control', 'no-store')
+    self.send_header('Access-Control-Allow-Origin', '*')
+    self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+    self.end_headers()
+    self.wfile.write(body)
+
+
+    def _read_body(self):
+        length = int(self.headers.get('Content-Length') or 0)
+        if length <= 0 or length > 64 * 1024:
+            return None
+        return self.rfile.read(length)
+
+    def _parse_json(self):
+        try:
+            raw = self._read_body()
+            if not raw:
+                return {}
+            return json.loads(raw.decode('utf-8'))
+        except Exception:
+            return None
+
+    def _bearer(self):
+        auth = self.headers.get('Authorization') or ''
+        if auth.startswith('Bearer '):
+            return auth[7:].strip()
+        return ''
+
+    def _error(self, status, message):
+        self._json(status, {'error': message})
+
+    def _dispatch(self, method):
+        path = self.path.split('?')[0].rstrip('/')
+        if path == '/api/me':
+            if method == 'GET':
+                return self._me()
+            if method == 'DELETE':
+                return self._delete_me()
+        if path == '/api/register' and method == 'POST':
+            return self._register()
+        if path == '/api/start' and method == 'POST':
+            return self._start()
+        if path == '/api/finish' and method == 'POST':
+            return self._finish()
+        if path == '/api/leaderboard' and method == 'GET':
+            return self._leaderboard()
+        if path == '/api/license' and method == 'GET':
+            return self._license()
+        if path == '/api/profile' and method == 'POST':
+            return self._profile()
+        self._error(404, '接口不存在')
+
+    def do_GET(self):
+        self._dispatch('GET')
+
+    def do_POST(self):
+        self._dispatch('POST')
+
+    def do_DELETE(self):
+        self._dispatch('DELETE')
+        
+        def do_OPTIONS(self):
+    self.send_response(204)
+    self.send_header('Access-Control-Allow-Origin', '*')
+    self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+    self.end_headers()
+
+
+    def _require_player(self, conn):
+        secret = self._bearer()
+        if not secret or not SECRET_RE.match(secret):
+            return None, None
+        row = find_player(conn, secret)
+        return (secret, row) if row else (None, None)
+
+    def _me(self):
+        with _db_lock, get_db() as conn:
+            secret, row = self._require_player(conn)
+            if not row:
+                self._error(401, '账号未注册')
+                return
+            player = player_payload(row)
+            rank = rank_of(conn, row['id'])
+            history = history_of(conn, row['id'])
+            self._json(200, {'player': player, 'rank': rank, 'history': history})
+
+    def _delete_me(self):
+        with _db_lock, get_db() as conn:
+            secret, row = self._require_player(conn)
+            if not row:
+                self._error(401, '账号未注册')
+                return
+            conn.execute('DELETE FROM runs WHERE player_id=?', (row['id'],))
+            conn.execute('DELETE FROM players WHERE id=?', (row['id'],))
+            self._json(200, {'ok': True})
+
+    def _register(self):
+        data = self._parse_json()
+        if not isinstance(data, dict):
+            self._error(400, '请求格式错误')
+            return
+        secret = str(data.get('secret') or '')
+        if not SECRET_RE.match(secret):
+            self._error(400, '注册码格式不正确')
+            return
+        with _db_lock, get_db() as conn:
+            row = find_player(conn, secret)
+            if row:
+                self._json(200, {'player': player_payload(row)})
+                return
+            cur = conn.execute(
+                'INSERT INTO players (secret, nickname, best, runs, created_at) '
+                'VALUES (?,?,?,?,?)',
+                (secret, '游客', 0, 0, int(time.time())),
+            )
+            row = conn.execute('SELECT * FROM players WHERE id=?', (cur.lastrowid,)).fetchone()
+            self._json(200, {'player': player_payload(row)})
+
+    def _start(self):
+        data = self._parse_json()
+        if not isinstance(data, dict):
+            self._error(400, '请求格式错误')
+            return
+        with _db_lock, get_db() as conn:
+            secret, row = self._require_player(conn)
+            if not row:
+                self._error(401, '账号未注册')
+                return
+            map_name = str(data.get('map') or 'egypt')[:32]
+            cur = conn.execute(
+                'INSERT INTO runs (player_id, map, ended) VALUES (?,?,NULL)',
+                (row['id'], map_name),
+            )
+            self._json(200, {'id': cur.lastrowid})
+
+    def _finish(self):
+        data = self._parse_json()
+        if not isinstance(data, dict):
+            self._error(400, '请求格式错误')
+            return
+        run_id = data.get('id')
+        if not isinstance(run_id, int):
+            self._error(400, '本局参数无效')
+            return
+        distance = max(0, int(data.get('distance') or 0))
+        coins = max(0, int(data.get('coins') or 0))
+        duration = max(0, int(data.get('duration') or 0))
+        finished = 1 if data.get('finished') else 0
+        with _db_lock, get_db() as conn:
+            secret, row = self._require_player(conn)
+            if not row:
+                self._error(401, '账号未注册')
+                return
+            run = conn.execute(
+                'SELECT * FROM runs WHERE id=? AND player_id=? AND ended IS NULL',
+                (run_id, row['id']),
+            ).fetchone()
+            if not run:
+                self._error(409, '本局已结束或不存在')
+                return
+            conn.execute(
+                'UPDATE runs SET distance=?, coins=?, duration=?, finished=?, ended=? '
+                'WHERE id=?',
+                (distance, coins, duration, finished, int(time.time()), run_id),
+            )
+            if finished:
+                best = max(row['best'], distance)
+                best_map = row['best_map']
+                if distance > row['best']:
+                    best_map = run['map']
+                conn.execute(
+                    'UPDATE players SET best=?, best_map=?, runs=runs+1 WHERE id=?',
+                    (best, best_map, row['id']),
+                )
+            else:
+                conn.execute('UPDATE players SET runs=runs+1 WHERE id=?', (row['id'],))
+            self._json(200, {'ok': True})
+
+    def _leaderboard(self):
+        with _db_lock, get_db() as conn:
+            secret, row = self._require_player(conn)
+            if not row:
+                self._error(401, '账号未注册')
+                return
+            rows = conn.execute(
+                'SELECT id, nickname, best, best_map AS map FROM players '
+                'WHERE best > 0 ORDER BY best DESC, id ASC LIMIT ?',
+                (TOP_N,),
+            ).fetchall()
+            self._json(200, {'players': [dict(r) for r in rows]})
+
+    def _license(self):
+        # 署名信息由服务端权威签发，前端校验 HMAC-SHA256 签名后渲染。
+        # 任何人改动前端署名都会被签名校验拒绝，从而无法伪造开发者信息。
+        self._json(200, license_payload())
+
+    def _profile(self):
+        data = self._parse_json()
+        if not isinstance(data, dict):
+            self._error(400, '请求格式错误')
+            return
+        nickname = str(data.get('nickname') or '').strip()[:NICKNAME_MAX]
+        if not nickname:
+            self._error(400, '昵称不能为空')
+            return
+        with _db_lock, get_db() as conn:
+            secret, row = self._require_player(conn)
+            if not row:
+                self._error(401, '账号未注册')
+                return
+            conn.execute('UPDATE players SET nickname=? WHERE id=?', (nickname, row['id']))
+            self._json(200, {'ok': True})
+
+
+def main():
+    init_db()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f'Naiwa leaderboard server listening on {HOST}:{PORT}', flush=True)
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    main()
